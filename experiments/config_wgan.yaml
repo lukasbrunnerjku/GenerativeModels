@@ -1,0 +1,32 @@
+# >> python gan.py --config experiments/config_wgan.yaml
+# >> tensorboard --logdir "lightning_logs"
+
+fit:
+    data:
+        size: 32
+        batch_size: 32
+        num_workers: 0
+        preload_data: true
+        flip_probability: 0.5
+        pin_memory: true
+
+    model:
+        size: 32
+        spectral_norm: true
+        hidden_channels: 16
+        lr_generator: 0.0002
+        latent_dim: 100
+        truncation_trick: true
+        truncation_factor: 0.2
+        lr_discriminator: 0.0002
+        wasserstein: true
+        n_critic: 2
+        diffaug_probability: 1.0
+        log_every_n_steps: 20
+        custom_weight_init: false
+
+    trainer:
+        gpus: 0
+        max_epochs: 500
+        fast_dev_run: false
+        log_every_n_steps: 20
