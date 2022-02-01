@@ -12,12 +12,14 @@ fit:
 
     model:
         size: 32
-        lr: 0.0001
+        lr: 0.001
+        hidden_channels: 32
+        enc_out_dim: 512
         latent_dim: 100
-        log_every_n_steps: 50
+        log_every_n_steps: 20
 
     trainer:
         gpus: 0
-        max_epochs: 100
+        max_epochs: 500
         fast_dev_run: false
         log_every_n_steps: 20

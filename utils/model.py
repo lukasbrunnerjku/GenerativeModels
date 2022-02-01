@@ -1,4 +1,5 @@
 import torch.nn as nn
+from torch.nn import functional as F
 import torch
 import math
 
@@ -70,8 +71,6 @@ class Generator(nn.Sequential):
         spectral_norm: bool = False,
     ):
         # 1x1 -> size x size
-        assert size % 2 == 0
-
         sub_modules = []
         dim = fin = fout = None
         intermediate = int(math.log2(size) - 3)
@@ -126,8 +125,6 @@ class Discriminator(nn.Sequential):
         spectral_norm: bool = False,
     ):
         # size x size -> 1x1
-        assert size % 2 == 0
-
         sub_modules = []
         fin = fout = None
         dim = size
@@ -171,3 +168,137 @@ class Discriminator(nn.Sequential):
             conv = SpectralNorm(conv)
         sub_modules.extend([conv, nn.Identity() if wasserstein else nn.Sigmoid()])
         super().__init__(*sub_modules)
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 4, 2, 1)
+        self.bn1 = nn.BatchNorm2d(hidden_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(hidden_channels, out_channels, 3, 1, 1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Conv2d(in_channels, out_channels, 1, 2, 0)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        x = self.downsample(x)
+
+        out += x
+        out = self.relu(out)
+
+        return out
+
+
+class Interpolate(nn.Module):
+    def __init__(self, size=None, scale_factor=None):
+        super().__init__()
+        self.size, self.scale_factor = size, scale_factor
+
+    def forward(self, x):
+        return F.interpolate(x, size=self.size, scale_factor=self.scale_factor)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            Interpolate(scale_factor=2),
+            nn.Conv2d(in_channels, hidden_channels, 3, 1, 1),
+        )
+        self.bn1 = nn.BatchNorm2d(hidden_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(hidden_channels, out_channels, 3, 1, 1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.upsample = nn.Sequential(
+            Interpolate(scale_factor=2),
+            nn.Conv2d(in_channels, out_channels, 1, 1, 0),
+        )
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        x = self.upsample(x)
+
+        out += x
+        out = self.relu(out)
+
+        return out
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=512,
+        hidden_channels=32,
+        num_blocks=4,
+        size=32,
+    ):
+        super().__init__()
+        assert math.log2(size) >= num_blocks
+
+        # overall spatial reduction by 2^num_blocks (default: 2^4 = 16)
+        blocks = []
+        blocks.append(EncoderBlock(in_channels, hidden_channels, 32))
+        in_ch = 32
+        for _ in range(num_blocks - 2):  # intermediate blocks
+            out_ch = min(512, 2 * in_ch)  # restric network width
+            blocks.append(EncoderBlock(in_ch, hidden_channels, out_ch))
+            in_ch = out_ch
+        blocks.append(EncoderBlock(in_ch, hidden_channels, out_channels))
+
+        self.blocks = nn.Sequential(*blocks)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x):
+        x = self.blocks(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        in_channels=512,
+        latent_dim=100,
+        out_channels=3,
+        hidden_channels=32,
+        num_blocks=4,
+        size=32,
+    ):
+        super().__init__()
+        assert size >= 2 ** (num_blocks + 1)
+        self.in_channels = in_channels
+        self.linear = nn.Linear(latent_dim, 4 * in_channels)
+
+        # overall spatial increase by 2^num_blocks (default: 2^4 = 16)
+        blocks = []
+        in_ch = in_channels
+        for _ in range(num_blocks - 1):  # intermediate blocks
+            out_ch = max(32, int(in_ch / 2))  # restrict network width
+            blocks.append(DecoderBlock(in_ch, hidden_channels, out_ch))
+            in_ch = out_ch
+        blocks.append(DecoderBlock(in_ch, hidden_channels, out_channels))
+
+        self.blocks = nn.Sequential(*blocks)
+        self.interpolate = Interpolate(size=size)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = x.view(x.size(0), self.in_channels, 2, 2)
+        x = self.blocks(x)
+        x = self.interpolate(x)
+        return x

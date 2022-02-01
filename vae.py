@@ -6,10 +6,9 @@ from pytorch_lightning.utilities import cli
 import pytorch_lightning as pl
 from torch import nn
 import torch
-from pl_bolts.models.autoencoders.components import resnet18_decoder as Decoder
-from pl_bolts.models.autoencoders.components import resnet18_encoder as Encoder
 
 from utils.dataset import PokeDataModule
+from utils.model import Encoder, Decoder
 
 # https://towardsdatascience.com/variational-autoencoder-demystified-with-pytorch-implementation-3a06bee395ed
 
@@ -19,10 +18,9 @@ class VAE(pl.LightningModule):
         self,
         size: int = 32,
         lr: float = 0.0001,
+        hidden_channels: int = 16,
         truncation_trick: bool = False,
         truncation_factor: float = 1.0,
-        b1: float = 0.9,
-        b2: float = 0.999,
         latent_dim: int = 100,
         enc_out_dim: int = 512,
         log_every_n_steps: int = 50,
@@ -31,9 +29,14 @@ class VAE(pl.LightningModule):
         self.save_hyperparameters()
         self.automatic_optimization = False
 
-        self.encoder = Encoder(False, False)
+        self.encoder = Encoder(
+            out_channels=enc_out_dim, hidden_channels=hidden_channels, size=size
+        )
         self.decoder = Decoder(
-            latent_dim=latent_dim, input_height=size, first_conv=False, maxpool1=False
+            in_channels=enc_out_dim,
+            latent_dim=latent_dim,
+            hidden_channels=hidden_channels,
+            size=size,
         )
 
         # distribution parameters
@@ -93,10 +96,14 @@ class VAE(pl.LightningModule):
         # reconstruction loss
         recon_loss = self.gaussian_likelihood(x_hat, self.log_scale, x)
 
-        # kl
+        # KL is non-negative and distributions are equal if KL is zero
         kl = self.kl_divergence(z, mu, std)
 
-        # elbo
+        # in its original formulation the ELBO is a lower bound
+        # on the log-likelihood of the data
+        # mathematically speaking: ELBO <= log(p(x))
+        # therefore by increasing the ELBO we increase the log-likelihood,
+        # in pytorch we take -ELBO as objective function we want to minimize
         elbo = kl - recon_loss
         elbo = elbo.mean()
 
