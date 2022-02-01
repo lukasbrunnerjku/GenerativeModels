@@ -1,325 +1,23 @@
-from path import Path
-from glob import glob
-from typing import Optional, List, Callable
 import numpy as np
-import cv2 as cv
 import torch
-import math
 from scipy.stats import truncnorm
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-import torchvision.transforms.functional as TF
-import torchvision.transforms as transforms
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import cli
-from torch.utils.data import DataLoader, Dataset
+
+from utils.dataset import PokeDataModule
+from utils.augmentation import DiffAugment
+from utils.model import Generator, Discriminator, SpectralNorm
 
 # TODO: # https://machinelearningmastery.com/a-gentle-introduction-to-the-biggan/
-
-
-def DiffAugment(x, policy="", channels_first=True):
-    # https://arxiv.org/pdf/2006.10738.pdf
-    # https://github.com/kvpratama/gan/blob/master/pokemon_dcgan/DiffAugmentation.py
-    if policy:
-        if not channels_first:
-            x = x.permute(0, 3, 1, 2)
-        for p in policy.split(","):
-            for f in AUGMENT_FNS[p]:
-                x = f(x)
-        if not channels_first:
-            x = x.permute(0, 2, 3, 1)
-        x = x.contiguous()
-    return x
-
-
-def rand_brightness(x):
-    x = x + (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) - 0.5)
-    return x
-
-
-def rand_saturation(x):
-    x_mean = x.mean(dim=1, keepdim=True)
-    x = (x - x_mean) * (
-        torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) * 2
-    ) + x_mean
-    return x
-
-
-def rand_contrast(x):
-    x_mean = x.mean(dim=[1, 2, 3], keepdim=True)
-    x = (x - x_mean) * (
-        torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) + 0.5
-    ) + x_mean
-    return x
-
-
-def rand_translation(x, ratio=0.125):
-    shift_x, shift_y = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
-    translation_x = torch.randint(
-        -shift_x, shift_x + 1, size=[x.size(0), 1, 1], device=x.device
-    )
-    translation_y = torch.randint(
-        -shift_y, shift_y + 1, size=[x.size(0), 1, 1], device=x.device
-    )
-    grid_batch, grid_x, grid_y = torch.meshgrid(
-        torch.arange(x.size(0), dtype=torch.long, device=x.device),
-        torch.arange(x.size(2), dtype=torch.long, device=x.device),
-        torch.arange(x.size(3), dtype=torch.long, device=x.device),
-    )
-    grid_x = torch.clamp(grid_x + translation_x + 1, 0, x.size(2) + 1)
-    grid_y = torch.clamp(grid_y + translation_y + 1, 0, x.size(3) + 1)
-    x_pad = F.pad(x, [1, 1, 1, 1, 0, 0, 0, 0])
-    x = (
-        x_pad.permute(0, 2, 3, 1)
-        .contiguous()[grid_batch, grid_x, grid_y]
-        .permute(0, 3, 1, 2)
-    )
-    return x
-
-
-def rand_cutout(x, ratio=0.5):
-    cutout_size = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
-    offset_x = torch.randint(
-        0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device
-    )
-    offset_y = torch.randint(
-        0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device
-    )
-    grid_batch, grid_x, grid_y = torch.meshgrid(
-        torch.arange(x.size(0), dtype=torch.long, device=x.device),
-        torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
-        torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
-    )
-    grid_x = torch.clamp(
-        grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1
-    )
-    grid_y = torch.clamp(
-        grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1
-    )
-    mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
-    mask[grid_batch, grid_x, grid_y] = 0
-    x = x * mask.unsqueeze(1)
-    return x
-
-
-AUGMENT_FNS = {
-    "color": [rand_brightness, rand_saturation, rand_contrast],
-    "translation": [rand_translation],
-    "cutout": [rand_cutout],
-}
-
-
-class PokeDataset(Dataset):
-    # https://www.kaggle.com/kvpratama/pokemon-images-dataset
-
-    def __init__(
-        self,
-        data_dir: str = ".",
-        image_size: int = 32,
-        transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    ) -> None:
-        super().__init__()
-        data_dir = Path(data_dir) / "pokemon_jpg" / "*.jpg"
-        self.files = glob(data_dir)
-        self.images: Optional[List[torch.Tensor]] = None
-        self.preprocess = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize(size=image_size),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-            ]
-        )
-        self.transform = transform
-
-    @property
-    def preloaded(self) -> bool:
-        return self.images is not None
-
-    def imread(self, file) -> torch.Tensor:
-        img: np.ndarray = cv.cvtColor(cv.imread(file), cv.COLOR_BGR2RGB)
-        return self.preprocess(img)
-
-    def preload(self) -> None:
-        self.images = [self.imread(file) for file in self.files]
-
-    def __getitem__(self, idx) -> torch.Tensor:
-        if self.preloaded:
-            img = self.images[idx]
-        else:
-            img = self.imread(self.files[idx])
-
-        # add pseudo class "label"
-        if self.transform is not None:
-            img = self.transform(img)
-
-        # we need to create additional data that does not serverly alter
-        # the original distribution thus light rotations are added
-        angle = np.random.uniform(-10, +10)
-        img = TF.rotate(img, angle, fill=1.0)
-
-        return img, 0
-
-    def __len__(self):
-        return len(self.files)
-
-
-class PokeDataModule(pl.LightningDataModule):
-    def __init__(
-        self,
-        data_dir: str = ".",
-        batch_size: int = 64,
-        num_workers: int = 0,
-        size: int = 32,
-        preload_data: bool = False,
-        flip_probability: float = 0.0,
-        pin_memory: bool = False,
-    ):
-        super().__init__()
-
-        self.data_dir = data_dir
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.size = size
-        self.preload_data = preload_data
-        self.flip_probability = flip_probability
-        self.pin_memory = pin_memory
-
-    def setup(self, stage=None):
-        transform = None
-        if self.flip_probability > 0.0:
-            transform = transforms.RandomVerticalFlip(p=self.flip_probability)
-        self.dataset = PokeDataset(
-            data_dir=self.data_dir, image_size=self.size, transform=transform
-        )
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=True,
-        )
-
-
-class Generator(nn.Sequential):
-    def __init__(
-        self,
-        in_channels=100,
-        out_channels=3,
-        hidden_channels=16,
-        size=32,
-        spectral_norm: bool = False,
-    ):
-        # 1x1 -> size x size
-        assert size % 2 == 0
-
-        sub_modules = []
-        dim = fin = fout = None
-        intermediate = int(math.log2(size) - 3)
-        for i in reversed(range(intermediate + 1)):
-            if i == intermediate:
-                dim = 4
-                fout = 2**i
-                conv = nn.ConvTranspose2d(
-                    in_channels, fout * hidden_channels, 4, 1, 0, bias=False
-                )
-                if spectral_norm:
-                    conv = SpectralNorm(conv)
-                sub_modules.extend(
-                    [
-                        conv,
-                        nn.LayerNorm((fout * hidden_channels, dim, dim)),
-                        nn.LeakyReLU(0.2, inplace=True),
-                    ]
-                )
-            else:
-                dim *= 2
-                fin = fout
-                fout = 2**i
-                conv = nn.ConvTranspose2d(
-                    fin * hidden_channels, fout * hidden_channels, 4, 2, 1, bias=False
-                )
-                if spectral_norm:
-                    conv = SpectralNorm(conv)
-                sub_modules.extend(
-                    [
-                        conv,
-                        nn.LayerNorm((fout * hidden_channels, dim, dim)),
-                        nn.LeakyReLU(0.2, inplace=True),
-                    ]
-                )
-
-        conv = nn.ConvTranspose2d(hidden_channels, out_channels, 4, 2, 1, bias=True)
-        if spectral_norm:
-            conv = SpectralNorm(conv)
-        sub_modules.extend([conv, nn.Tanh()])
-        super().__init__(*sub_modules)
-
-
-class Discriminator(nn.Sequential):
-    def __init__(
-        self,
-        in_channels=3,
-        out_channels=1,
-        hidden_channels=16,
-        size=32,
-        wasserstein=False,
-        spectral_norm: bool = False,
-    ):
-        # size x size -> 1x1
-        assert size % 2 == 0
-
-        sub_modules = []
-        fin = fout = None
-        dim = size
-        intermediate = int(math.log2(size) - 3)
-        for i in range(intermediate + 1):
-            if i == 0:
-                dim = int(dim / 2)
-                fout = 2**i
-                conv = nn.Conv2d(
-                    in_channels, fout * hidden_channels, 4, 2, 1, bias=False
-                )
-                if spectral_norm:
-                    conv = SpectralNorm(conv)
-                sub_modules.extend(
-                    [
-                        conv,
-                        nn.LayerNorm((fout * hidden_channels, dim, dim)),
-                        nn.LeakyReLU(0.2, inplace=True),
-                    ]
-                )
-            else:
-                dim = int(dim / 2)
-                fin = fout
-                fout = 2**i
-                conv = nn.Conv2d(
-                    fin * hidden_channels, fout * hidden_channels, 4, 2, 1, bias=False
-                )
-                if spectral_norm:
-                    conv = SpectralNorm(conv)
-                sub_modules.extend(
-                    [
-                        conv,
-                        nn.LayerNorm((fout * hidden_channels, dim, dim)),
-                        nn.LeakyReLU(0.2, inplace=True),
-                    ]
-                )
-
-        assert dim == 4
-        conv = nn.Conv2d(fout * hidden_channels, out_channels, 4, 1, 0, bias=True)
-        if spectral_norm:
-            conv = SpectralNorm(conv)
-        sub_modules.extend([conv, nn.Identity() if wasserstein else nn.Sigmoid()])
-        super().__init__(*sub_modules)
 
 
 def weights_init(m):
     # usage: model.apply(weights_init)
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        m.weight.data.normal_(0.0, 0.008)
+        m.weight.data.normal_(0.0, 0.02)
 
 
 def make_trainable(net, val):
@@ -328,7 +26,7 @@ def make_trainable(net, val):
 
 
 def noise_factory(
-    noise_std: float = 0.4, gamma: float = 0.99, every_nth_call: int = 26
+    noise_std: float = 0.2, gamma: float = 0.99, every_nth_call: int = 26
 ):
     decay = 1.0
     calls = 0
@@ -341,64 +39,6 @@ def noise_factory(
         return decay * noise_std * torch.randn_like(imgs) + imgs
 
     return add_noise
-
-
-def l2normalize(v, eps=1e-4):
-    return v / (v.norm() + eps)
-
-
-class SpectralNorm(nn.Module):
-    def __init__(self, module, name="weight", power_iterations=1):
-        super(SpectralNorm, self).__init__()
-        self.module = module
-        self.name = name
-        self.power_iterations = power_iterations
-        if not self._made_params():
-            self._make_params()
-
-    def _update_u_v(self):
-        u = getattr(self.module, self.name + "_u")
-        v = getattr(self.module, self.name + "_v")
-        w = getattr(self.module, self.name + "_bar")
-
-        height = w.data.shape[0]
-        _w = w.view(height, -1)
-        for _ in range(self.power_iterations):
-            v = l2normalize(torch.matmul(_w.t(), u))
-            u = l2normalize(torch.matmul(_w, v))
-
-        sigma = u.dot((_w).mv(v))
-        setattr(self.module, self.name, w / sigma.expand_as(w))
-
-    def _made_params(self):
-        try:
-            getattr(self.module, self.name + "_u")
-            getattr(self.module, self.name + "_v")
-            getattr(self.module, self.name + "_bar")
-            return True
-        except AttributeError:
-            return False
-
-    def _make_params(self):
-        w = getattr(self.module, self.name)
-
-        height = w.data.shape[0]
-        width = w.view(height, -1).data.shape[1]
-
-        u = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
-        v = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
-        u.data = l2normalize(u.data)
-        v.data = l2normalize(v.data)
-        w_bar = nn.Parameter(w.data)
-
-        del self.module._parameters[self.name]
-        self.module.register_parameter(self.name + "_u", u)
-        self.module.register_parameter(self.name + "_v", v)
-        self.module.register_parameter(self.name + "_bar", w_bar)
-
-    def forward(self, *args):
-        self._update_u_v()
-        return self.module.forward(*args)
 
 
 class GAN(pl.LightningModule):
@@ -450,7 +90,7 @@ class GAN(pl.LightningModule):
         if not spectral_norm:
             self.clamp_parameters_to_cube()
 
-        self.validation_z = self.sample_noise(batch_size=8)
+        self.validation_z = self.sample_noise(batch_size=2)
         self.add_noise_real = noise_factory()
         self.add_noise_fake = noise_factory()
 
@@ -514,9 +154,9 @@ class GAN(pl.LightningModule):
                 self.log_generated_images(
                     "generated from random noise", generated_imgs, self.global_step
                 )
-                # self.log_gradients(self.discriminator)
-                # if self.global_step >= self.hparams.n_critic - 1:
-                #     self.log_gradients(self.generator)
+                self.log_gradients(self.discriminator)
+                if self.global_step >= self.hparams.n_critic - 1:
+                    self.log_gradients(self.generator)
 
         else:
             imgs, _ = batch
@@ -681,9 +321,9 @@ class GAN(pl.LightningModule):
         return (image * 0.5 + 0.5).clamp(0, 1)  # from [-1, 1] to [0, 1]
 
     def log_generated_images(
-        self, tag: str, imgs: torch.Tensor, global_step: int, max_imgs: int = 2
+        self, tag: str, imgs: torch.Tensor, global_step: int
     ) -> None:
-        grid = torchvision.utils.make_grid(self.postprocess(imgs[:max_imgs]))
+        grid = torchvision.utils.make_grid(self.postprocess(imgs))
         self.logger.experiment.add_image(tag, grid, global_step)
 
     def manual_clip_gradients(self, net):
@@ -703,7 +343,7 @@ class GAN(pl.LightningModule):
             :, None, None, None
         ]  # steps x1x1x1
         z_intp = alpha * z_end + (1.0 - alpha) * z_start
-        generated_images = self.generator(z_intp)
+        generated_images = self(z_intp)
         for i, img in enumerate(self.postprocess(generated_images)):
             self.logger.experiment.add_image("latent walk", img, i)
 
@@ -750,11 +390,12 @@ class GAN(pl.LightningModule):
                     )
 
     def log_graph(self):
+        class GAN(nn.Sequential):
+            pass
+
         z = self.validation_z.to(next(self.generator.parameters()))
         if self.current_epoch == 0:
-            self.logger.experiment.add_graph(
-                nn.Sequential(self.generator, self.discriminator), z
-            )
+            self.logger.experiment.add_graph(GAN(self.generator, self.discriminator), z)
 
     def on_epoch_end(self) -> None:
         z = self.validation_z.to(next(self.generator.parameters()))
@@ -772,7 +413,9 @@ class GAN(pl.LightningModule):
 if __name__ == "__main__":
     pl.seed_everything(seed=42)
     trainer_defaults = dict(
-        logger=pl.loggers.TensorBoardLogger("lightning_logs", default_hp_metric=False),
+        logger=pl.loggers.TensorBoardLogger(
+            "lightning_logs", name="gan", default_hp_metric=False
+        ),
     )
     cli.LightningCLI(
         model_class=GAN,

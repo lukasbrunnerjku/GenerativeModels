@@ -1,0 +1,23 @@
+# >> python vae.py --config experiments/config_vae.yaml
+# >> tensorboard --logdir "lightning_logs"
+
+fit:
+    data:
+        size: 32
+        batch_size: 32
+        num_workers: 0
+        preload_data: false
+        flip_probability: 0.5
+        pin_memory: true
+
+    model:
+        size: 32
+        lr: 0.0001
+        latent_dim: 100
+        log_every_n_steps: 50
+
+    trainer:
+        gpus: 0
+        max_epochs: 100
+        fast_dev_run: false
+        log_every_n_steps: 20
