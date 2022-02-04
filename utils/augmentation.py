@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 # https://arxiv.org/pdf/2006.10738.pdf
 # https://github.com/kvpratama/gan/blob/master/pokemon_dcgan/DiffAugmentation.py

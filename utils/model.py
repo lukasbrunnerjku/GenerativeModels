@@ -44,16 +44,15 @@ class SpectralNorm(nn.Module):
         w = getattr(self.module, self.name)
 
         height = w.data.shape[0]
-
-        u = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
-        v = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
+        u = w.data.new(height).normal_(0, 1)
+        v = w.data.new(height).normal_(0, 1)
         u.data = l2normalize(u.data)
         v.data = l2normalize(v.data)
-        w_bar = nn.Parameter(w.data)
+        w_bar = nn.Parameter(w.data, requires_grad=True)
 
         del self.module._parameters[self.name]
-        self.module.register_parameter(self.name + "_u", u)
-        self.module.register_parameter(self.name + "_v", v)
+        self.module.register_buffer(self.name + "_u", u)
+        self.module.register_buffer(self.name + "_v", v)
         self.module.register_parameter(self.name + "_bar", w_bar)
 
     def forward(self, *args):
@@ -69,6 +68,7 @@ class Generator(nn.Sequential):
         hidden_channels=16,
         size=32,
         spectral_norm: bool = False,
+        use_interpolate: bool = False,
     ):
         # 1x1 -> size x size
         sub_modules = []
@@ -80,7 +80,7 @@ class Generator(nn.Sequential):
                 fout = 2**i
                 conv = nn.ConvTranspose2d(
                     in_channels, fout * hidden_channels, 4, 1, 0, bias=False
-                )
+                )  # H -> H+3 thus 1x1 -> 4x4
                 if spectral_norm:
                     conv = SpectralNorm(conv)
                 sub_modules.extend(
@@ -94,9 +94,27 @@ class Generator(nn.Sequential):
                 dim *= 2
                 fin = fout
                 fout = 2**i
-                conv = nn.ConvTranspose2d(
-                    fin * hidden_channels, fout * hidden_channels, 4, 2, 1, bias=False
-                )
+                if use_interpolate:
+                    conv = nn.Sequential(
+                        Interpolate(scale_factor=2),
+                        nn.Conv2d(
+                            fin * hidden_channels,
+                            fout * hidden_channels,
+                            3,
+                            1,
+                            1,
+                            bias=False,
+                        ),
+                    )  # H -> 2H
+                else:
+                    conv = nn.ConvTranspose2d(
+                        fin * hidden_channels,
+                        fout * hidden_channels,
+                        4,
+                        2,
+                        1,
+                        bias=False,
+                    )  # H -> 2H
                 if spectral_norm:
                     conv = SpectralNorm(conv)
                 sub_modules.extend(
@@ -123,6 +141,7 @@ class Discriminator(nn.Sequential):
         size=32,
         wasserstein=False,
         spectral_norm: bool = False,
+        use_interpolate: bool = False,
     ):
         # size x size -> 1x1
         sub_modules = []
@@ -133,9 +152,17 @@ class Discriminator(nn.Sequential):
             if i == 0:
                 dim = int(dim / 2)
                 fout = 2**i
-                conv = nn.Conv2d(
-                    in_channels, fout * hidden_channels, 4, 2, 1, bias=False
-                )
+                if use_interpolate:
+                    conv = nn.Sequential(
+                        Interpolate(scale_factor=0.5),
+                        nn.Conv2d(
+                            in_channels, fout * hidden_channels, 3, 1, 1, bias=False
+                        ),
+                    )  # 2H -> H
+                else:
+                    conv = nn.Conv2d(
+                        in_channels, fout * hidden_channels, 4, 2, 1, bias=False
+                    )  # 2H -> H
                 if spectral_norm:
                     conv = SpectralNorm(conv)
                 sub_modules.extend(
@@ -149,9 +176,27 @@ class Discriminator(nn.Sequential):
                 dim = int(dim / 2)
                 fin = fout
                 fout = 2**i
-                conv = nn.Conv2d(
-                    fin * hidden_channels, fout * hidden_channels, 4, 2, 1, bias=False
-                )
+                if use_interpolate:
+                    conv = nn.Sequential(
+                        Interpolate(scale_factor=0.5),
+                        nn.Conv2d(
+                            fin * hidden_channels,
+                            fout * hidden_channels,
+                            3,
+                            1,
+                            1,
+                            bias=False,
+                        ),
+                    )  # 2H -> H
+                else:
+                    conv = nn.Conv2d(
+                        fin * hidden_channels,
+                        fout * hidden_channels,
+                        4,
+                        2,
+                        1,
+                        bias=False,
+                    )  # 2H -> H
                 if spectral_norm:
                     conv = SpectralNorm(conv)
                 sub_modules.extend(

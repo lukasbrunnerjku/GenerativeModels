@@ -11,7 +11,11 @@ from utils.dataset import PokeDataModule
 from utils.augmentation import DiffAugment
 from utils.model import Generator, Discriminator, SpectralNorm
 
-# TODO: # https://machinelearningmastery.com/a-gentle-introduction-to-the-biggan/
+# TODO:
+# hinge loss!
+# more depth!
+# https://machinelearningmastery.com/a-gentle-introduction-to-the-biggan/
+# https://arxiv.org/pdf/2002.02117v1.pdf  # smooth convs avoid checkerboard?
 
 
 def weights_init(m):
@@ -56,6 +60,7 @@ class GAN(pl.LightningModule):
         b2: float = 0.999,
         latent_dim: int = 100,
         spectral_norm: bool = False,
+        use_interpolate: bool = False,
         wasserstein: bool = True,
         hidden_channels: int = 16,
         diffaug_probability: float = 1.0,
@@ -75,12 +80,14 @@ class GAN(pl.LightningModule):
             hidden_channels=hidden_channels,
             size=size,
             spectral_norm=spectral_norm,
+            use_interpolate=use_interpolate,
         )
         self.discriminator = Discriminator(
             hidden_channels=hidden_channels,
             wasserstein=wasserstein,
             size=size,
             spectral_norm=spectral_norm,
+            use_interpolate=use_interpolate,
         )
 
         if custom_weight_init and not spectral_norm:
@@ -132,6 +139,11 @@ class GAN(pl.LightningModule):
                 self.clamp_parameters_to_cube()
             self.log("d_loss", d_loss, True)
 
+            if self.global_step % self.hparams.log_every_n_steps == 0:
+                # for n, p in self.discriminator.named_parameters():
+                #     print("name:", n, "has gradient:", p.grad is not None)
+                self.log_gradients(self.discriminator)
+
             # train generator
             if self.global_step % self.hparams.n_critic == self.hparams.n_critic - 1:
                 z = self.sample_noise(imgs.size(0))
@@ -154,7 +166,6 @@ class GAN(pl.LightningModule):
                 self.log_generated_images(
                     "generated from random noise", generated_imgs, self.global_step
                 )
-                self.log_gradients(self.discriminator)
                 if self.global_step >= self.hparams.n_critic - 1:
                     self.log_gradients(self.generator)
 
@@ -245,45 +256,56 @@ class GAN(pl.LightningModule):
         return opt_g, opt_d
 
     def log_gradients(self, net):
-        cname = net.__class__.__name__ + "/Gradients"
+        cname = net.__class__.__name__
         for name, module in net.named_modules():
-            if isinstance(module, SpectralNorm):
-                """
-                (0): SpectralNorm(
-                    (module): Conv2d(3, 16, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1), bias=False)
-                )
-                """
-                continue
-            else:  # name of Conv2d or ConvTranspose2d -> ie. 0.module
-                name = name.split(".module")[0]
-            # name is ie. '8' = the position of that module in nn.Sequential
             if isinstance(module, nn.Conv2d):
-                name = f"{int(name):02d}_Conv2d"
-                self.logger.experiment.add_histogram(
-                    f"{cname}/{name}_weight", module.weight.grad.data, self.global_step
-                )
+                name = f"{name}_Conv2d"
+                if module.weight.grad is not None:  # can happen due to SpectralNorm
+                    self.logger.experiment.add_histogram(
+                        f"{cname}/{name}_weight_grad",
+                        module.weight.grad.data,
+                        self.global_step,
+                    )
                 if module.bias is not None:
                     self.logger.experiment.add_histogram(
-                        f"{cname}/{name}_bias", module.bias.grad.data, self.global_step
+                        f"{cname}/{name}_bias_grad",
+                        module.bias.grad.data,
+                        self.global_step,
                     )
             elif isinstance(module, nn.ConvTranspose2d):
-                name = f"{int(name):02d}_ConvTranspose2d"
-                self.logger.experiment.add_histogram(
-                    f"{cname}/{name}_weight", module.weight.grad.data, self.global_step
-                )
+                name = f"{name}_ConvTranspose2d"
+                if module.weight.grad is not None:  # can happen due to SpectralNorm
+                    self.logger.experiment.add_histogram(
+                        f"{cname}/{name}_weight_grad",
+                        module.weight.grad.data,
+                        self.global_step,
+                    )
                 if module.bias is not None:
                     self.logger.experiment.add_histogram(
-                        f"{cname}/{name}_bias", module.bias.grad.data, self.global_step
+                        f"{cname}/{name}_bias_grad",
+                        module.bias.grad.data,
+                        self.global_step,
                     )
             elif isinstance(module, nn.LayerNorm):
-                name = f"{int(name):02d}_Layernorm"
+                name = f"{name}_Layernorm"
                 self.logger.experiment.add_histogram(
-                    f"{cname}/{name}_weight", module.weight.grad.data, self.global_step
+                    f"{cname}/{name}_weight_grad",
+                    module.weight.grad.data,
+                    self.global_step,
                 )
                 if module.bias is not None:
                     self.logger.experiment.add_histogram(
-                        f"{cname}/{name}_bias", module.bias.grad.data, self.global_step
+                        f"{cname}/{name}_bias_grad",
+                        module.bias.grad.data,
+                        self.global_step,
                     )
+            elif isinstance(module, SpectralNorm):
+                name = f"{name}_SpectralNorm"
+                self.logger.experiment.add_histogram(
+                    f"{cname}/{name}_weight_grad",
+                    module.module.weight_bar.grad.data,
+                    self.global_step,
+                )
 
     def sample_noise(self, batch_size) -> torch.Tensor:
         if (
@@ -350,19 +372,8 @@ class GAN(pl.LightningModule):
     def log_weights(self, net):
         cname = net.__class__.__name__
         for name, module in net.named_modules():
-            if isinstance(module, SpectralNorm):
-                """
-                (0): SpectralNorm(
-                    (module): Conv2d(3, 16, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1), bias=False)
-                )
-                """
-                continue
-            else:  # name of Conv2d or ConvTranspose2d -> ie. 0.module
-                name = name.split(".module")[0]
-
-            # name is ie. '8' = the position of that module in nn.Sequential
             if isinstance(module, nn.Conv2d):
-                name = f"{int(name):02d}_Conv2d"
+                name = f"{name}_Conv2d"
                 self.logger.experiment.add_histogram(
                     f"{cname}/{name}_weight", module.weight.data, self.current_epoch
                 )
@@ -371,7 +382,7 @@ class GAN(pl.LightningModule):
                         f"{cname}/{name}_bias", module.bias.data, self.current_epoch
                     )
             elif isinstance(module, nn.ConvTranspose2d):
-                name = f"{int(name):02d}_ConvTranspose2d"
+                name = f"{name}_ConvTranspose2d"
                 self.logger.experiment.add_histogram(
                     f"{cname}/{name}_weight", module.weight.data, self.current_epoch
                 )
@@ -380,7 +391,7 @@ class GAN(pl.LightningModule):
                         f"{cname}/{name}_bias", module.bias.data, self.current_epoch
                     )
             elif isinstance(module, nn.LayerNorm):
-                name = f"{int(name):02d}_Layernorm"
+                name = f"{name}_Layernorm"
                 self.logger.experiment.add_histogram(
                     f"{cname}/{name}_weight", module.weight.data, self.current_epoch
                 )
@@ -388,6 +399,13 @@ class GAN(pl.LightningModule):
                     self.logger.experiment.add_histogram(
                         f"{cname}/{name}_bias", module.bias.data, self.current_epoch
                     )
+            elif isinstance(module, SpectralNorm):
+                name = f"{name}_SpectralNorm"
+                self.logger.experiment.add_histogram(
+                    f"{cname}/{name}_weight",
+                    module.module.weight_bar.data,
+                    self.current_epoch,
+                )
 
     def log_graph(self):
         class GAN(nn.Sequential):
