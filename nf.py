@@ -9,6 +9,54 @@ import pytest
 import pdb
 
 
+class ActNorm(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        ndim: int,
+        global_affine_init: float = 1.0,
+        global_affine_type: str = "SOFTPLUS",
+    ) -> None:
+        super().__init__()
+
+        if global_affine_type == "SIGMOID":
+            global_scale = 2.0 - np.log(10.0 / global_affine_init - 1.0)
+            self.global_scale_activation = lambda a: 10 * torch.sigmoid(a - 2.0)
+        elif global_affine_type == "SOFTPLUS":
+            global_scale = 2.0 * np.log(np.exp(0.5 * 10.0 * global_affine_init) - 1)
+            self.softplus = nn.Softplus(beta=0.5)
+            self.global_scale_activation = lambda a: 0.1 * self.softplus(a)
+        elif global_affine_type == "EXP":
+            global_scale = np.log(global_affine_init)
+            self.global_scale_activation = lambda a: torch.exp(a)
+        else:
+            raise ValueError(
+                'Global affine activation must be "SIGMOID", "SOFTPLUS" or "EXP"'
+            )
+
+        self.global_scale = nn.Parameter(
+            torch.ones(1, channels, *([1] * ndim)) * float(global_scale)
+        )
+        self.global_offset = nn.Parameter(torch.zeros(1, channels, *([1] * ndim)))
+        self.ndim = ndim
+
+    def forward(self, x, rev=False):
+        s = self.global_scale_activation(self.global_scale)
+
+        if rev:
+            y = (x - self.global_offset) / s
+            logdet = -torch.sum(
+                torch.log(torch.abs(self.s)), dim=tuple(range(1, s.ndim))
+            )  # B,
+        else:
+            y = s * x + self.global_offset
+            logdet = torch.sum(
+                torch.log(torch.abs(self.s)), dim=tuple(range(1, s.ndim))
+            )  # B,
+
+        return y, logdet
+
+
 class FastFlowCoupling(nn.Module):
     def __init__(
         self,
@@ -56,6 +104,32 @@ class FastFlowCoupling(nn.Module):
             y = torch.cat((y1, y2), dim=1)
 
         return y, logdet
+
+
+def test_norm(channels=8):
+    actnorm = ActNorm(channels, 0)
+    x = torch.randn(1, channels)
+    y, logdet = actnorm(x)
+    assert y.shape == x.shape
+    assert logdet.shape == x.shape[:1]
+
+    actnorm = ActNorm(channels, 1, 5)
+    x = torch.randn(1, channels)
+    y, logdet = actnorm(x)
+    assert y.shape == x.shape
+    assert logdet.shape == x.shape[:1]
+
+    actnorm = ActNorm(channels, 2)
+    x = torch.randn(1, channels, 5, 5)
+    y, logdet = actnorm(x)
+    assert y.shape == x.shape
+    assert logdet.shape == x.shape[:1]
+
+    actnorm = ActNorm(channels, 3)
+    x = torch.randn(1, channels, 5, 5, 5)
+    y, logdet = actnorm(x)
+    assert y.shape == x.shape
+    assert logdet.shape == x.shape[:1]
 
 
 def test_coupling(channels=8):
@@ -113,7 +187,7 @@ def test_coupling(channels=8):
 
 
 class Permute(nn.Module):
-    def __init__(self, channels: int, ndim: int = 0) -> None:
+    def __init__(self, channels: int, ndim: int) -> None:
         super().__init__()
 
         w = np.zeros((channels, channels))
@@ -141,22 +215,22 @@ class Permute(nn.Module):
 
 
 def test_permute(channels=8):
-    perm = Permute(channels, ndim=0)
+    perm = Permute(channels, 0)
     x = torch.randn(1, channels)
     y, _ = perm(x)
     assert torch.allclose(perm(y, rev=True)[0], x)
 
-    perm = Permute(channels, ndim=1)
+    perm = Permute(channels, 1)
     x = torch.randn(1, channels, 5)
     y, _ = perm(x)
     assert torch.allclose(perm(y, rev=True)[0], x)
 
-    perm = Permute(channels, ndim=2)
+    perm = Permute(channels, 2)
     x = torch.randn(1, channels, 5, 5)
     y, _ = perm(x)
     assert torch.allclose(perm(y, rev=True)[0], x)
 
-    perm = Permute(channels, ndim=3)
+    perm = Permute(channels, 3)
     x = torch.randn(1, channels, 5, 5, 5)
     y, _ = perm(x)
     assert torch.allclose(perm(y, rev=True)[0], x)
