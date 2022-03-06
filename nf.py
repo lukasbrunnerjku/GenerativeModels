@@ -111,6 +111,9 @@ class Coupling(nn.Module):
             self.f_clamp = torch.tanh
         elif clamp_activation == "SIGMOID":
             self.f_clamp = lambda u: 2.0 * (torch.sigmoid(u) - 0.5)
+        elif clamp_activation == "NONE":
+            self.f_clamp = lambda u: u
+            self.clamp = 1.0
         else:
             raise ValueError(f'Unknown clamp activation "{clamp_activation}"')
 
@@ -119,17 +122,17 @@ class Coupling(nn.Module):
             y1, y2 = torch.split(x, self.channels // 2, dim=1)
 
             o2 = self.subnet2(y2)
-            s2, b2 = o2[:, : self.channels // 2], o2[:, self.channels // 2 :]
-            s2 = torch.exp(self.clamp * self.f_clamp(s2))
-            x1 = (y1 - b2) / s2
+            log_s2, b2 = o2[:, : self.channels // 2], o2[:, self.channels // 2 :]
+            log_s2 = self.clamp * self.f_clamp(log_s2)
+            x1 = (y1 - b2) * torch.exp(-log_s2)
 
             o1 = self.subnet1(x1)
-            s1, b1 = o1[:, : self.channels // 2], o1[:, self.channels // 2 :]
-            s1 = torch.exp(self.clamp * self.f_clamp(s1))
-            x2 = (y2 - b1) / s1
+            log_s1, b1 = o1[:, : self.channels // 2], o1[:, self.channels // 2 :]
+            log_s1 = self.clamp * self.f_clamp(log_s1)
+            x2 = (y2 - b1) * torch.exp(-log_s1)
 
-            s = torch.cat((s2, s1), dim=1)
-            logdet = -torch.sum(torch.log(s), dim=tuple(range(1, s.ndim)))  # B,
+            log_s = torch.cat((log_s2, log_s1), dim=1)
+            logdet = -torch.sum(log_s, dim=tuple(range(1, log_s.ndim)))  # B,
             x = torch.cat((x1, x2), dim=1)
 
             return x, logdet
@@ -138,17 +141,17 @@ class Coupling(nn.Module):
             x1, x2 = torch.split(x, self.channels // 2, dim=1)
 
             o1 = self.subnet1(x1)
-            s1, b1 = o1[:, : self.channels // 2], o1[:, self.channels // 2 :]
-            s1 = torch.exp(self.clamp * self.f_clamp(s1))
-            y2 = s1 * x2 + b1
+            log_s1, b1 = o1[:, : self.channels // 2], o1[:, self.channels // 2 :]
+            log_s1 = self.clamp * self.f_clamp(log_s1)
+            y2 = torch.exp(log_s1) * x2 + b1
 
             o2 = self.subnet2(y2)
-            s2, b2 = o2[:, : self.channels // 2], o2[:, self.channels // 2 :]
-            s2 = torch.exp(self.clamp * self.f_clamp(s2))
-            y1 = s2 * x1 + b2
+            log_s2, b2 = o2[:, : self.channels // 2], o2[:, self.channels // 2 :]
+            log_s2 = self.clamp * self.f_clamp(log_s2)
+            y1 = torch.exp(log_s2) * x1 + b2
 
-            s = torch.cat((s2, s1), dim=1)
-            logdet = torch.sum(torch.log(s), dim=tuple(range(1, s.ndim)))  # B,
+            log_s = torch.cat((log_s2, log_s1), dim=1)
+            logdet = torch.sum(log_s, dim=tuple(range(1, log_s.ndim)))  # B,
             y = torch.cat((y1, y2), dim=1)
 
             return y, logdet
@@ -362,7 +365,7 @@ class FastFlow(nn.Module):
         ndim: int,
         subnet_constructor1: callable,
         subnet_constructor2: callable,
-        num_blocks: int = 8,
+        num_blocks: int = 4,
     ) -> None:
         super().__init__()
 
@@ -384,9 +387,9 @@ class FastFlow(nn.Module):
         return self.blocks(x, rev)
 
 
-def test_fastflow(channels=8, num_blocks=4):
+def test_fastflow(channels=8, num_blocks=2):
 
-    # TODO: numerical stability issues ie. with 8 blocks won't pass test!
+    # TODO: numerical stability issues in Coupling ie. with 8 blocks won't pass test!
 
     fastflow = FastFlow(channels, 2, subnet_conv_3x3, subnet_conv_1x1, num_blocks)
     x = torch.randn(1, channels, 5, 5)
@@ -397,8 +400,8 @@ def test_fastflow(channels=8, num_blocks=4):
 
 
 if __name__ == "__main__":
-    # test_permute(channels=8)
-    # test_coupling(channels=8)
-    # test_norm(channels=8)
-    # test_flowsequential(channels=8)
+    test_permute(channels=8)
+    test_coupling(channels=8)
+    test_norm(channels=8)
+    test_flowsequential(channels=8)
     test_fastflow(channels=8)
